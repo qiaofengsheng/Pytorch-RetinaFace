@@ -92,16 +92,33 @@ class RetinaFaceDataset(Dataset):
         words.append(labels)
         return imgs_path, words
 
+def detection_collate(batch):
+    """Custom collate fn for dealing with batches of images that have a different
+    number of associated object annotations (bounding boxes).
+
+    Arguments:
+        batch: (tuple) A tuple of tensor images and lists of annotations
+
+    Return:
+        A tuple containing:
+            1) (tensor) batch of images stacked on their 0 dim
+            2) (list of tensors) annotations for a given image are stacked on 0 dim
+    """
+    targets = []
+    imgs = []
+    for _, sample in enumerate(batch):
+        for _, tup in enumerate(sample):
+            if torch.is_tensor(tup):
+                imgs.append(tup)
+            elif isinstance(tup, type(np.empty(0))):
+                annos = torch.from_numpy(tup).float()
+                targets.append(annos)
+    return (torch.stack(imgs, 0), targets)
+
 
 if __name__ == '__main__':
-    data = RetinaFaceDataset(r'G:\widerFace\widerface\train\label.txt', (640, 640))
-    image, label = data[0]
-    img = np.array(image.permute(1, 2, 0)).astype(np.float).copy()
-    print(image.shape, label)
-    label = torch.tensor(label, dtype=torch.int)[:, :-1].reshape(-1, 2).tolist()
+    data = RetinaFaceDataset(r'/data/face_det/data/widerface/train/label.txt', (640, 640))
+    dataloader=DataLoader(data,batch_size=5,shuffle=True,collate_fn=detection_collate,drop_last=True)
+    for i in dataloader:
+        print(i)
 
-    cv2.rectangle(img, tuple(label[0]), tuple(label[1]), (0, 0, 255), 2)
-    for i in label[2:]:
-        cv2.circle(img, (i[0], i[1]), 2, (0, 255, 0), 2)
-    cv2.imshow('img', img)
-    cv2.waitKey(0)

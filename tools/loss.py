@@ -1,18 +1,26 @@
+from base64 import encode
 import torch
 
 
-def anchor_exchange_xyxy(anchor):
+def xywh_exchange_xyxy(boxes):
     '''
     将生成的anchor坐标信息由xywh转为xyxy格式
     :param anchor: anchor  16800 x 4  shape: x y w h
     :return: anchor 16800 x 4  shape x1 y1 x2 y2
     '''
-    tmp_anchor = anchor
-    tmp_anchor[:, 0] = anchor[:, 0] - anchor[:, 2] / 2
-    tmp_anchor[:, 1] = anchor[:, 1] - anchor[:, 3] / 2
-    tmp_anchor[:, 2] = anchor[:, 0] + anchor[:, 2] / 2
-    tmp_anchor[:, 3] = anchor[:, 1] + anchor[:, 3] / 2
-    return tmp_anchor
+    tmp_boxes = boxes
+    tmp_boxes[:, 0] = tmp_boxes[:, 0] - tmp_boxes[:, 2] / 2
+    tmp_boxes[:, 1] = tmp_boxes[:, 1] - tmp_boxes[:, 3] / 2
+    tmp_boxes[:, 2] = tmp_boxes[:, 0] + tmp_boxes[:, 2] / 2
+    tmp_boxes[:, 3] = tmp_boxes[:, 1] + tmp_boxes[:, 3] / 2
+    return tmp_boxes
+
+
+def xyxy_exchange_xwwh(boxes):
+    '''
+    将xyxy坐标转为xywh
+    '''
+    return torch.cat((boxes[:, 2:] + boxes[:, :2]) / 2, boxes[:, 2:] - boxes[:, :2], 1)
 
 
 def interest_areas(box1, box2):
@@ -49,17 +57,39 @@ def truth_anchor_iou(box1, box2):
     return interest_area / tmp_area
 
 
-def anchors_select_strategy(box1, box2):
-    '''
-        ToDo 建议框筛选策略
-    :param box1:
-    :param box2:
-    :return:
-    '''
-    pass
+def anchors_select_strategy(threshold, truths, anchors, variances, labels, landms, loc_t, conf_t, landm_t, idx):
+    # 计算真实框和anchors的iou
+    overlaps = truth_anchor_iou(truths, anchors)  # N x 16800
+
+    # 取每个真实框与anchors中iou最大的anchor
+    best_prior_overlaps, best_prior_ids = overlaps.max(1, keep_dim=True)  # N x 1     N x 1
+    best_prior_overlaps, best_prior_ids = best_prior_overlaps.squeeze(1), best_prior_ids.squeeze(1)  # N    N
+    # 取anchors中与每个真实框iou最大的真实框
+    best_truth_overlaps, best_truth_ids = overlaps.max(0, keep_dim=True)  # 1 x 16800   1 x 16800
+    best_truth_overlaps, best_truth_ids = best_truth_overlaps.squeeze(0), best_truth_ids.squeeze(0)
+
+    # 保证最大的iou的anchor保留下来
+    best_truth_overlaps.index_fill_(0, best_prior_ids, 2)
+    # 更新每个anchor对于iou最大的真实框的id
+    for i in range(best_prior_ids.size(0)):
+        best_truth_ids[best_prior_ids[i]] = i
+
+    # 取出每个anchor与目标框iou最大的真实框
+    matches_bbox = truths[best_prior_ids]
+    # 取出对应的标签
+    conf = labels[best_prior_ids]
+    # 小于阈值的标签为背景
+    conf[best_prior_ids < threshold] = 0
+    # 对bbox，landmarks进行编码，并将结果信息返回
+    bboxes = bbox_encode(matches_bbox, anchors, variances)
+    matches_landmarks = landms[best_prior_ids]
+    landmarks = landmark_encode(matches_landmarks, anchors, variances)
+    loc_t[idx] = bboxes  # [num_priors,4]
+    conf_t[idx] = conf  # [num_priors] 
+    landm_t[idx] = landmarks  # [num_priors,10]
 
 
-def retinaface_loss(predict, target, anchors):
+def retinaface_loss(params, predict, target, anchors):
     '''
         ToDo
     损失 : cls loss + bbox loss + landmark loss
@@ -68,7 +98,40 @@ def retinaface_loss(predict, target, anchors):
     :param anchors: 建议框
     :return: cls_loss + bbox_loss + landmark_loss
     '''
-    pass
+    bbox_data, conf_data, landmark_data = predict
+    anchors = anchors
+    nums = bbox_data.size(0)
+    num_anchors = anchors.size(0)
+
+    bbox_target = torch.Tensor(nums, num_anchors, 4)
+    landmark_target = torch.Tensor(nums, num_anchors, 10)
+    conf_target = torch.Tensor(nums, num_anchors)
+    for idx in range(nums):
+        truth_bbox = target[:, :4]
+        truth_landmark = target[:, 4:14]
+        truth_label = target[:, -1]
+        default = anchors.data
+        anchors_select_strategy(params['threshold'], truth_bbox, default, params['variances'], truth_label,
+                                truth_landmark, bbox_target, conf_target, landmark_target, idx)
+
+    pos1 = conf_target > 0
+    num_positive = pos1.long().sum(1, keepdims=True)
+    N1 = max(num_positive.data.sum().float, 1)
+    pos_idx1 = pos1.unsqueeze(pos1.dim()).expand_as(landmark_data)
+    landmark_predict = landmark_data[pos_idx1].reshape(-1, 10)
+    landmark_target = landmark_target[pos_idx1].reshape(-1, 10)
+    loss_landmark = torch.nn.SmoothL1Loss(reduction='sum').forward(landmark_predict, landmark_target)
+
+    pos2 = conf_target != 0
+    conf_target[pos2] = 1
+    pos_idx2 = pos1.unsqueeze(pos2.dim()).expand_as(bbox_data)
+    bbox_predict = bbox_target[pos_idx2].reshape(-1, 4)
+    bbox_target = bbox_target[pos_idx2].reshape(-1, 4)
+    loss_bbox = torch.nn.SmoothL1Loss(reduction='sum').forward(bbox_predict, bbox_target)
+
+    loss_conf = torch.nn.CrossEntropyLoss(reduction='sum').forward(conf_data, conf_target.long().reshape(-1))
+
+    return loss_conf, loss_bbox, loss_landmark
 
 
 def bbox_encode(targets, anchors, variances):
@@ -149,5 +212,5 @@ if __name__ == '__main__':
     a = torch.Tensor([[1, 2, 3, 4], [2, 3, 4, 5]])
     b = torch.Tensor([[12, 21, 31, 42], [22, 23, 24, 52], [2, 3, 4, 5]])
     # area = interest_areas(a, b)
-    c = anchor_exchange_xyxy(b)
+    c = xywh_exchange_xyxy(b)
     print(c)
